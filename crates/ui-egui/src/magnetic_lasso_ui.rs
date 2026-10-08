@@ -1,19 +1,20 @@
 //! Magnetic Lasso Tool (L): a selection border that snaps to edges as the pointer moves.
 //!
 //! Click to set the first fastening point, then move the pointer along an edge (with the button up
-//! or held down): the border from the last fastening point to the pointer follows the most
-//! prominent edges within the detection width, and points fasten by themselves as it goes, more
-//! often at a higher Frequency. A click fastens a point; ⌥-click draws a straight segment and
-//! ⌥-drag a freehand one. ⌫ or Delete removes the last fastening point. Clicking the first point,
-//! a double-click or ↩ closes the border along the edges (⌥ with a straight segment); Esc cancels.
-//! [ and ] narrow or widen the detection width by 1 px. As in Photoshop, the border follows the
-//! active layer's pixels (the composite for a layer without pixels of its own).
+//! or held down): the border from the last fastening point to the pointer follows the nearest
+//! well-defined edge within the detection width, and points fasten by themselves where the border
+//! has settled (path cooling), sooner at a higher Frequency. A click fastens a point; ⌥-click draws
+//! a straight segment and ⌥-drag a freehand one. ⌫ or Delete removes the last fastening point.
+//! Clicking the first point, a double-click or ↩ closes the border along the edges (⌥ with a
+//! straight segment); Esc cancels. [ and ] narrow or widen the detection width by 1 px. As in
+//! Photoshop, the border follows the active layer's pixels (the composite for a layer without
+//! pixels of its own).
 //!
 //! The border closes through `select.magneticLasso` with `"trace": false`: the selection is exactly
 //! the outline drawn, in one history step, and an action replays that outline.
 
 use egui::{Color32, Key, Modifiers, Pos2, Rect, Stroke, vec2};
-use photocraft_algo::magnetic::{self, Settings};
+use photocraft_algo::magnetic::{self, Cooling, Settings};
 use photocraft_engine::magnetic_cmds::EdgeSource;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -55,6 +56,8 @@ pub struct Runtime {
     source: Option<EdgeSource>,
     /// Pointer moves were batched (`PhotocraftApp::defer_live_stroke`): trace once at the end.
     pending: bool,
+    /// Which part of the live segment has stopped changing (path cooling).
+    cooling: Cooling,
 }
 
 /// Detection settings from the options bar, for an event with pen `pressure`.
@@ -68,12 +71,23 @@ fn settings(app: &PhotocraftApp, pressure: f32) -> Settings {
     Settings::new(width, o.magnetic_contrast / 100.0)
 }
 
-/// How far the border runs before a point fastens by itself (document px): 8 screen points at
-/// Frequency 100, 98 at 0, 47 at the default 57.
-fn spacing(app: &PhotocraftApp) -> f64 {
+/// The options bar's Frequency (0..100).
+fn frequency(app: &PhotocraftApp) -> f64 {
     let f = app.ui.tool_options.magnetic_frequency;
-    let f = if f.is_finite() { f64::from(f.clamp(0.0, 100.0)) } else { 57.0 };
-    (8.0 + (100.0 - f) * 0.9) / f64::from(app.current_zoom().max(0.01))
+    if f.is_finite() { f64::from(f.clamp(0.0, 100.0)) } else { 57.0 }
+}
+
+/// The fastening distance (document px): 8 screen points at Frequency 100, 98 at 0, 47 at the
+/// default 57. A point fastens where the border has settled once it is at least half this far from
+/// the last one, and by distance alone at twice this.
+fn spacing(app: &PhotocraftApp) -> f64 {
+    (8.0 + (100.0 - frequency(app)) * 0.9) / f64::from(app.current_zoom().max(0.01))
+}
+
+/// Pointer updates the border must keep its course for before it counts as settled: 2 at Frequency
+/// 100, 12 at 0, 6 at the default 57.
+fn settle_updates(app: &PhotocraftApp) -> u32 {
+    (2.0 + (100.0 - frequency(app)) / 10.0).round() as u32
 }
 
 /// Within this distance of the first point (document px), a click closes the border.
@@ -212,19 +226,31 @@ fn extend_trail(app: &mut PhotocraftApp, q: [f64; 2], s: Settings) {
 }
 
 /// The pointer is at `q`: trace the live segment to the edge near it and, with `fasten`, fasten
-/// points behind the pointer while the live segment is long enough.
+/// points behind the pointer where the border has settled.
 fn follow(app: &mut PhotocraftApp, q: [f64; 2], s: Settings, fasten: bool) {
     extend_trail(app, q, s);
     let target = snap(app, q, s);
-    let every = spacing(app);
+    let (every, updates) = (spacing(app), settle_updates(app));
     for _ in 0..64 {
         let Some(&from) = app.ui.magnetic.path.last() else { return };
         let guide = app.ui.magnetic.trail.clone();
         let live = trace(app, from, target, &guide, s);
-        // The part of the border `spacing` behind its start no longer changes as the pointer
-        // moves: fasten it.
-        match cut(&live, every).filter(|_| fasten) {
+        // Path cooling: fasten at the farthest point the border has kept its course to while the
+        // pointer moved on, so a point never fastens on a stretch that is still changing. A border
+        // that never settles (noise, no edges) fastens by distance.
+        app.magnetic.cooling.update(&live);
+        let len = magnetic::length(&live);
+        let settled = app.magnetic.cooling.settled(updates).min(len - 1.0);
+        let at = if settled >= every / 2.0 {
+            Some(settled)
+        } else if len >= 2.0 * every {
+            Some(every)
+        } else {
+            None
+        };
+        match at.filter(|_| fasten).and_then(|at| cut(&live, at)) {
             Some((head, point)) => {
+                app.magnetic.cooling.reset();
                 let m = &mut app.ui.magnetic;
                 m.path.extend(head.into_iter().skip(1));
                 m.anchors.push(m.path.len() - 1);
@@ -410,8 +436,8 @@ pub fn keys(app: &mut PhotocraftApp, ctx: &egui::Context) -> bool {
     true
 }
 
-/// The border being drawn, its fastening points, and the closing mark when the pointer is over the
-/// first point.
+/// The border being drawn, its fastening points (hollow squares, the last one filled, as in
+/// Photoshop), and the closing mark when the pointer is over the first point.
 pub fn draw(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform, hover: Option<Pos2>) {
     let m = &app.ui.magnetic;
     if !m.active() {
@@ -420,9 +446,14 @@ pub fn draw(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform, hover:
     let screen = |q: &[f64; 2]| xf.to_screen(q[0] as f32, q[1] as f32);
     let pts: Vec<Pos2> = m.path.iter().chain(m.live.iter().skip(1)).map(screen).collect();
     crate::tool_feedback::draw_ants(painter, &pts, false);
-    for p in m.anchors.iter().filter_map(|&i| m.path.get(i)).map(screen) {
+    let last = m.anchors.len().saturating_sub(1);
+    for (k, p) in m.anchors.iter().filter_map(|&i| m.path.get(i)).map(screen).enumerate() {
+        // Black and white rings read on any pixels.
         let r = Rect::from_center_size(p, vec2(5.0, 5.0));
-        painter.rect_filled(r, 0.0, Color32::WHITE);
+        if k == last {
+            painter.rect_filled(r, 0.0, Color32::BLACK);
+        }
+        painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::WHITE), egui::StrokeKind::Inside);
         painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Outside);
     }
     if let Some(h) = hover

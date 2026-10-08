@@ -46,13 +46,53 @@ fn contrast_sets_which_steps_are_edges() {
 }
 
 #[test]
-fn snaps_to_the_most_prominent_edge() {
+fn snaps_to_the_nearest_well_defined_edge() {
     let read = Cell::new(0);
-    // A faint step at x = 12 and a strong one at x = 18.
-    let mut f = image(|x, _| grey([0, 40, 255][usize::from(x >= 12) + usize::from(x >= 18)]), &read);
     let mut t = Tracer::new(Rect::new(0, 0, 40, 20));
+    // A clear step at x = 12 under the pointer and a much stronger one at x = 18: the edge being
+    // traced wins, not the stronger one further away.
+    let mut f = image(|x, _| grey([0, 100, 255][usize::from(x >= 12) + usize::from(x >= 18)]), &read);
     let p = t.snap(&mut f, [13.0, 10.0], Settings::new(10.0, 0.1)).unwrap();
-    assert!((p[0] - 18.0).abs() < 0.01, "{p:?}");
+    assert!((p[0] - 12.0).abs() < 0.01, "{p:?}");
+    // A step barely above the contrast gives way to a well-defined edge close by.
+    let mut f = image(|x, _| grey([0, 28, 255][usize::from(x >= 12) + usize::from(x >= 15)]), &read);
+    let mut t = Tracer::new(Rect::new(0, 0, 40, 20));
+    let p = t.snap(&mut f, [12.5, 10.0], Settings::new(10.0, 0.1)).unwrap();
+    assert!((p[0] - 15.0).abs() < 0.01, "{p:?}");
+}
+
+/// An orange disc on light green with white marks inside it, like a badge with an icon and text:
+/// the marks are a stronger edge than the disc's.
+fn badge(x: i32, y: i32) -> [u8; 4] {
+    let d = (f64::from(x) + 0.5 - 128.0).hypot(f64::from(y) + 0.5 - 120.0);
+    let mark = (80..176).contains(&x) && (190..197).contains(&y) || (40..47).contains(&x) && (100..141).contains(&y);
+    match (d < 100.0, mark) {
+        (true, true) => [255, 255, 255, 255],
+        (true, false) => [250, 101, 51, 255],
+        _ => [217, 253, 211, 255],
+    }
+}
+
+#[test]
+fn stronger_edges_inside_the_width_do_not_pull_the_border_off() {
+    let read = Cell::new(0);
+    let mut f = image(badge, &read);
+    let mut t = Tracer::new(Rect::new(0, 0, 256, 240));
+    // The white marks are 12–30 px inside the disc, well within the 30 px width.
+    let s = Settings::new(30.0, 0.1);
+    let on = |deg: f64, off: f64| {
+        let a = deg.to_radians();
+        [128.0 + (100.0 + off) * a.cos(), 120.0 + (100.0 + off) * a.sin()]
+    };
+    let mut from = t.snap(&mut f, on(0.0, 2.0), s).unwrap();
+    for k in 1..=24 {
+        let to = t.snap(&mut f, on(f64::from(k) * 15.0, if k % 2 == 0 { 3.0 } else { -2.0 }), s).unwrap();
+        for p in t.trace(&mut f, from, to, &[], s) {
+            let r = (p[0] - 128.0).hypot(p[1] - 120.0);
+            assert!((r - 100.0).abs() < 1.5, "{p:?} is {r:.1} from the centre (segment {k})");
+        }
+        from = to;
+    }
 }
 
 #[test]
@@ -192,4 +232,33 @@ fn split_and_simplify() {
     assert!((total - 700.0).abs() < 1e-9);
     assert_eq!(simplify(&[[0.0, 0.0], [1.0, 0.1], [2.0, 0.0], [3.0, 5.0]], 0.3), vec![[0.0, 0.0], [2.0, 0.0], [3.0, 5.0]]);
     assert!(split(&[], 256.0).is_empty());
+}
+
+#[test]
+fn cooling_tracks_how_long_the_border_kept_its_course() {
+    let mut c = Cooling::default();
+    let a = [[0.0, 0.0], [40.0, 0.0]];
+    for _ in 0..3 {
+        c.update(&a);
+    }
+    assert_eq!((c.settled(3), c.settled(4)), (40.0, 0.0));
+    // The same course for 20 px, then off elsewhere: only the shared stretch keeps ageing.
+    let b = [[0.0, 0.0], [20.0, 0.0], [30.0, 15.0]];
+    c.update(&b);
+    assert_eq!((c.settled(4), c.settled(1)), (20.0, 38.0));
+    // Within the tolerance counts as the same course.
+    c.update(&[[0.0, 0.0], [20.0, 0.5], [30.0, 15.0]]);
+    assert_eq!((c.settled(5), c.settled(2)), (20.0, 37.0));
+    // A new fastening point starts over.
+    c.update(&[[5.0, 5.0], [40.0, 5.0]]);
+    assert_eq!((c.settled(2), c.settled(1)), (0.0, 35.0));
+    c.reset();
+    c.update(&a);
+    assert_eq!(c.settled(2), 0.0);
+    // Nothing to go on.
+    c.update(&[]);
+    assert_eq!(c.settled(1), 0.0);
+    c.update(&[[1.0, 1.0]]);
+    c.update(&[[1.0, 1.0]]);
+    assert_eq!((c.settled(2), c.settled(3)), (0.0, 0.0));
 }

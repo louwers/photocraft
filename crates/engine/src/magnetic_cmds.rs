@@ -55,7 +55,7 @@ impl EdgeSource {
         self.doc.id
     }
 
-    /// Where a fastening point near `p` goes: on the most prominent edge within the detection
+    /// Where a fastening point near `p` goes: on the nearest well-defined edge within the detection
     /// width, else at `p` (see [`Tracer::snap`]).
     pub fn snap(&mut self, p: [f64; 2], s: Settings) -> Option<[f64; 2]> {
         let (doc, layer) = (&self.doc, self.layer);

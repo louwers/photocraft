@@ -95,6 +95,91 @@ fn tracing_around_a_shape_selects_it() {
 }
 
 #[test]
+fn points_fasten_where_the_border_has_settled() {
+    let mut app = app();
+    click(&mut app, 52.0, 37.0, Modifiers::NONE);
+    // 38 px along the top edge in one move: too short to fasten by distance (47 px at Frequency
+    // 57), and the border has only just appeared.
+    tool_event(&mut app, ToolEvent::Move { x: 90.0, y: 37.0, pressure: 1.0 }, Modifiers::NONE);
+    assert_eq!(app.ui.magnetic.anchors.len(), 1);
+    // The pointer lingers there; the border keeps its course, so it fastens where it settled.
+    for (k, y) in [36.0, 38.0, 37.0, 36.5, 37.5, 37.0, 36.0, 38.0].into_iter().enumerate() {
+        tool_event(&mut app, ToolEvent::Move { x: 90.0 + (k % 2) as f64, y, pressure: 1.0 }, Modifiers::NONE);
+    }
+    let m = &app.ui.magnetic;
+    assert_eq!(m.anchors.len(), 2, "{m:?}");
+    let p = m.path[m.anchors[1]];
+    assert!((p[1] - 40.0).abs() < 0.01 && (75.0..=92.0).contains(&p[0]), "on the edge, behind the pointer: {p:?}");
+}
+
+#[test]
+fn frequency_sets_how_soon_points_fasten() {
+    let count = |frequency: f32| {
+        let mut app = app();
+        app.ui.tool_options.magnetic_frequency = frequency;
+        click(&mut app, 52.0, 37.0, Modifiers::NONE);
+        hover_along(&mut app, &[[52.0, 37.0], [128.0, 37.0], [133.0, 42.0], [133.0, 108.0]]);
+        let m = &app.ui.magnetic;
+        assert!(m.path.iter().all(|p| on_square(*p, 1.0)), "{m:?}");
+        m.anchors.len()
+    };
+    let (often, rarely) = (count(100.0), count(0.0));
+    assert!(often > rarely + 2, "Frequency 100: {often} points, 0: {rarely}");
+}
+
+/// An orange disc on light green with white marks inside, like a badge with an icon and text.
+fn badge_app() -> PhotocraftApp {
+    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+    app.run("file.new", json!({"width": 256, "height": 240})).unwrap();
+    app.sync_views();
+    app.session
+        .edit("paint", |doc, _| {
+            let bg = doc.layers[0].surface_mut().unwrap();
+            let ch = bg.channels();
+            let mut px = Vec::with_capacity(256 * 240 * ch);
+            for y in 0..240 {
+                for x in 0..256 {
+                    let d = (f64::from(x) + 0.5 - 128.0).hypot(f64::from(y) + 0.5 - 120.0);
+                    let mark = (80..176).contains(&x) && (190..197).contains(&y) || (40..47).contains(&x) && (100..141).contains(&y);
+                    let c = match (d < 100.0, mark) {
+                        (true, true) => [1.0, 1.0, 1.0],
+                        (true, false) => [0.98, 0.4, 0.2],
+                        _ => [0.85, 0.99, 0.83],
+                    };
+                    px.extend_from_slice(&[c[0], c[1], c[2], 1.0][..ch]);
+                }
+            }
+            bg.write_region(Rect::new(0, 0, 256, 240), &px);
+            Ok(())
+        })
+        .unwrap();
+    app.ui.tool = Tool::MagneticLasso;
+    app
+}
+
+/// White marks inside a disc are a stronger edge than the disc's, and within a wide detection width
+/// of it: tracing the disc stays on the disc.
+#[test]
+fn tracing_a_badge_stays_on_its_rim() {
+    let mut app = badge_app();
+    app.ui.tool_options.magnetic_width = 30.0;
+    let at = |t: f64, k: usize| {
+        let r = 100.0 + 2.0 * (5.0 * t).sin() + 1.5 * (k as f64 * 0.7).sin();
+        [128.0 + r * t.cos(), 120.0 + r * t.sin()]
+    };
+    let p = at(0.0, 0);
+    click(&mut app, p[0], p[1], Modifiers::NONE);
+    let pts: Vec<[f64; 2]> = (1..200).map(|k| at(k as f64 / 200.0 * 6.0, k)).collect();
+    hover_along(&mut app, &pts);
+    let m = &app.ui.magnetic;
+    assert!(m.anchors.len() > 5, "{:?}", m.anchors);
+    for q in m.path.iter().chain(&m.live) {
+        let r = (q[0] - 128.0).hypot(q[1] - 120.0);
+        assert!((r - 100.0).abs() < 1.5, "{q:?} is {r:.1} from the centre");
+    }
+}
+
+#[test]
 fn enter_closes_along_the_edges_and_alt_closes_straight() {
     let mut app = app();
     // Over the top and right edges only; the rest closes along the edges from the last point.

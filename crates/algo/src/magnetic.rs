@@ -14,6 +14,9 @@
 //!
 //! Pixels are read lazily in blocks through a caller-supplied fetch (a layer's pixels or the
 //! composite), so tracing on a 36 MP image reads only the area around the border.
+//!
+//! [`Cooling`] is the paper's path cooling: it tracks how much of the live segment has stopped
+//! changing as the pointer moves, so points can fasten where the border has settled.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -103,9 +106,13 @@ impl Tracer {
         self.blocks.values().map(Vec::len).sum()
     }
 
-    /// Where a fastening point near `p` goes: the centre of the most prominent edge within the
+    /// Where a fastening point near `p` goes: the centre of the nearest well-defined edge within the
     /// detection width, or `p` itself (kept inside the image) when no edge there reaches the
     /// contrast. `None` when `p` is not a finite point or the image is empty.
+    ///
+    /// Every edge at least twice the contrast is equally well defined, so a stronger edge further
+    /// away never wins over the one being traced (white text inside a coloured disc, say); a faint
+    /// edge still gives way to a well-defined one close by.
     pub fn snap(&mut self, fetch: &mut Fetch, p: [f64; 2], s: Settings) -> Option<[f64; 2]> {
         let s = Settings::new(s.width, s.contrast);
         let p = self.clamp_point(p)?;
@@ -126,8 +133,9 @@ impl Tracer {
                 if d > r {
                     continue;
                 }
-                // The strongest edge, a little in favour of the nearer one.
-                let score = strength * (1.0 - 0.25 * (d / r) as f32);
+                // A full-strength edge a whole detection width away scores like a faint one under
+                // the pointer.
+                let score = definition(strength, s.contrast) - (d / r) as f32;
                 if best.is_none_or(|(b, _)| score > b) {
                     best = Some((score, f.point(i, x, y, s.contrast)));
                 }
@@ -436,7 +444,7 @@ fn search(f: &Field, near: &[f32], rad2: f32, start: usize, goal: usize, contras
         let on_edge = s >= contrast && f.ridge.get(i).copied().unwrap_or(false);
         // No pull below the contrast, full pull from twice the contrast, a little more for
         // stronger edges still.
-        let good = ((s - contrast) / contrast.max(0.02)).clamp(0.0, 1.0) * (0.6 + 0.4 * s.min(1.0));
+        let good = definition(s, contrast) * (0.6 + 0.4 * s.min(1.0));
         // Grows linearly away from the pointer's path, so the border hugs it where there is no edge.
         let pull = (d2 / rad2.max(1.0)).sqrt().min(1.0);
         let centre = if on_edge { 0.0 } else { 1.0 };
@@ -503,6 +511,94 @@ fn search(f: &Field, near: &[f32], rad2: f32, start: usize, goal: usize, contras
     }
     cells.reverse();
     Some(cells)
+}
+
+/// How close a sample of a new live segment must stay to the previous one to count as unchanged (px).
+const SETTLE_TOLERANCE: f64 = 0.75;
+
+/// Path cooling (Mortensen & Barrett): how long each stretch of the live segment, the border from
+/// the last fastening point to the pointer, has kept its course. Feed it every new live segment;
+/// [`Cooling::settled`] says how far along it the border has stayed put, which is where a point
+/// can fasten without cutting off a course that is still changing.
+#[derive(Clone, Debug, Default)]
+pub struct Cooling {
+    live: Vec<[f64; 2]>,
+    /// `ages[k]`: consecutive segments, this one included, that ran through the same place `k` px
+    /// along. Never increases along the segment: a place counts only while everything before it
+    /// held too.
+    ages: Vec<u32>,
+}
+
+impl Cooling {
+    /// The next live segment. One that starts somewhere else (a new fastening point) starts over.
+    pub fn update(&mut self, live: &[[f64; 2]]) {
+        // Samples every pixel along the segment (capped: a border is never this long).
+        let n = (length(live).floor() as usize).saturating_add(1).min(1 << 20);
+        let same_start = matches!((self.live.first(), live.first()), (Some(a), Some(b)) if dist(*a, *b) <= SETTLE_TOLERANCE);
+        let mut ages = vec![1u32; n];
+        if same_start && self.live.len() >= 2 {
+            let mut walker = Walker::new(live);
+            for (k, age) in ages.iter_mut().enumerate() {
+                let p = walker.at(k as f64);
+                if self.live.windows(2).map(|w| dist2_segment(p, w[0], w[1])).fold(f64::INFINITY, f64::min) > SETTLE_TOLERANCE * SETTLE_TOLERANCE {
+                    break;
+                }
+                *age = self.ages.get(k).copied().unwrap_or(0).saturating_add(1);
+            }
+        }
+        self.live = live.to_vec();
+        self.ages = ages;
+    }
+
+    /// How far (px) along the latest live segment the border has kept its course for at least
+    /// `updates` segments in a row.
+    pub fn settled(&self, updates: u32) -> f64 {
+        match self.ages.iter().position(|a| *a < updates) {
+            Some(0) => 0.0,
+            Some(k) => (k - 1) as f64,
+            None => self.ages.len().saturating_sub(1) as f64,
+        }
+    }
+
+    /// Forget the live segment (the border was fastened, shortened or finished).
+    pub fn reset(&mut self) {
+        self.live.clear();
+        self.ages.clear();
+    }
+}
+
+/// Points at increasing distances along a polyline.
+struct Walker<'a> {
+    p: &'a [[f64; 2]],
+    seg: usize,
+    /// Length of the polyline before segment `seg`.
+    before: f64,
+}
+
+impl<'a> Walker<'a> {
+    fn new(p: &'a [[f64; 2]]) -> Self {
+        Walker { p, seg: 0, before: 0.0 }
+    }
+
+    /// The point `s` along the polyline (its end beyond it); `s` must not decrease between calls.
+    fn at(&mut self, s: f64) -> [f64; 2] {
+        while let (Some(&a), Some(&b)) = (self.p.get(self.seg), self.p.get(self.seg + 1)) {
+            let d = dist(a, b);
+            if s <= self.before + d {
+                let t = if d > 0.0 { ((s - self.before) / d).clamp(0.0, 1.0) } else { 0.0 };
+                return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+            }
+            self.before += d;
+            self.seg += 1;
+        }
+        self.p.last().copied().unwrap_or_default()
+    }
+}
+
+/// How well defined an edge of `strength` is at `contrast`: 0 below the contrast, rising to 1 at
+/// twice the contrast and staying there.
+fn definition(strength: f32, contrast: f32) -> f32 {
+    ((strength - contrast) / contrast.max(0.02)).clamp(0.0, 1.0)
 }
 
 /// The gradient-direction term of a link from a pixel with edge tangent `tp` to its neighbour at
